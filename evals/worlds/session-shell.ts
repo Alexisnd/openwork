@@ -504,6 +504,63 @@ export async function externalSessionVisibility(seed: Seed) {
     other,
     homePath,
     engine: resolveEvalEngine(),
+    async observeSessionRequests(workspaceId: string) {
+      const debuggerUrl = app.client.webSocketDebuggerUrl;
+      if (!debuggerUrl) throw new Error("Session request witness needs a desktop CDP endpoint");
+      const socket = new WebSocket(debuggerUrl);
+      const ready = Promise.withResolvers<void>();
+      const requests: { method: string; path: string }[] = [];
+      const prefixes = ["workspace", "w"].map((mount) => `/${mount}/${encodeURIComponent(workspaceId)}/opencode2/api/session`);
+      let failure: Error | undefined;
+      let disposed = false;
+      const fail = () => {
+        if (disposed) return;
+        failure = new Error("Session request witness lost its CDP connection");
+        ready.reject(failure);
+      };
+      const timeout = setTimeout(() => ready.reject(new Error("Session request witness did not become ready")), 15_000);
+      socket.addEventListener("open", () => socket.send(JSON.stringify({ id: 1, method: "Network.enable" })));
+      socket.addEventListener("error", fail);
+      socket.addEventListener("close", fail);
+      socket.addEventListener("message", (event) => {
+        const message: unknown = JSON.parse(String(event.data));
+        if (!isRecord(message)) return;
+        if (message.id === 1) {
+          if (message.error) ready.reject(new Error("Session request witness could not enable Network events"));
+          else ready.resolve();
+        }
+        if (message.method !== "Network.requestWillBeSent" || !isRecord(message.params)) return;
+        const request = message.params.request;
+        if (!isRecord(request) || typeof request.url !== "string" || typeof request.method !== "string") return;
+        const url = new URL(request.url);
+        const path = url.pathname.replace(/\/+$/, "");
+        if (url.origin !== serverUrl.origin || !prefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))) return;
+        // Retain only method/path: headers and request bodies may contain secrets.
+        requests.push({ method: request.method, path });
+      });
+      try {
+        await ready.promise;
+      } catch (error) {
+        disposed = true;
+        socket.close();
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+      return {
+        snapshot() {
+          if (failure) throw failure;
+          return {
+            lists: requests.filter((request) => request.method === "GET" && prefixes.includes(request.path)).length,
+            reads: requests.filter((request) => request.method === "GET").map((request) => request.path),
+          };
+        },
+        async [Symbol.asyncDispose]() {
+          disposed = true;
+          socket.close();
+        },
+      };
+    },
     async observeWorkspaceEvents(workspaceId: string) {
       const abort = new AbortController();
       const url = new URL(`${externalServerUrl}/workspace/${encodeURIComponent(workspaceId)}/opencode2/api/event`);
@@ -545,6 +602,32 @@ export async function externalSessionVisibility(seed: Seed) {
       const response = await engineSessionProbe({ engine: resolveEvalEngine(), serverUrl: externalServerUrl, token: serverToken, workspaceId }).list();
       if (!response.ok) throw new Error(`Session list returned HTTP ${response.status}`);
       return response.data.map((session) => session.id);
+    },
+    async forkSessionOutsideWindow(workspaceId: string, sessionId: string) {
+      const base = `${externalServerUrl}/workspace/${encodeURIComponent(workspaceId)}/opencode2/api/session/${encodeURIComponent(sessionId)}`;
+      const request = async (path: string, body?: unknown): Promise<unknown> => {
+        const response = await fetch(`${base}${path}`, {
+          method: body === undefined ? "GET" : "POST",
+          headers: { Authorization: `Bearer ${serverToken}`, "Content-Type": "application/json" },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!response.ok) throw new Error(`External fork setup ${path} returned HTTP ${response.status}`);
+        return response.status === 204 ? null : response.json();
+      };
+      // A settled native shell message supplies a fork boundary without a model.
+      await request("/shell", { command: "printf 'External fork history\\n'" });
+      const sourceBefore = { info: await request(""), history: await request("/export") };
+      const response = await request("/fork", { boundary: { type: "through" } });
+      if (!isRecord(response) || !isRecord(response.data) || typeof response.data.id !== "string" || typeof response.data.title !== "string") {
+        throw new Error("Native fork did not return a complete session identity and title");
+      }
+      return {
+        id: response.data.id,
+        title: response.data.title,
+        sourceBefore,
+        sourceAfter: { info: await request(""), history: await request("/export") },
+      };
     },
     /** The sidebar's own per-workspace session lists and load state. */
     // TODO(primitive): probe.route should expose the sidebar's per-workspace session lists.

@@ -530,7 +530,6 @@ export function SessionPage(props: SessionPageProps) {
   const [createGroupLabel, setCreateGroupLabel] = useState("");
   const [createGroupWorkspaceId, setCreateGroupWorkspaceId] = useState<string | null>(null);
   const browserPanelRef = usePanelRef();
-  const preserveSidePanelOnPanelOpenRef = useRef(false);
 
   const selectNarrowPane = useCallback((pane: NarrowSessionPane) => {
     setNarrowPane(pane);
@@ -623,9 +622,11 @@ export function SessionPage(props: SessionPageProps) {
     const browser = (window as Window).__OPENWORK_ELECTRON__?.browser;
     if (!browser) return;
     const unsubOpen = browser.onPanelOpened?.((payload) => {
-      if (preserveSidePanelOnPanelOpenRef.current) {
-        preserveSidePanelOnPanelOpenRef.current = false;
-        return;
+      const ownerSessionId = payload?.ownerSessionId ?? props.selectedSessionId;
+      if (ownerSessionId && payload?.tab) {
+        // A requested navigation selects its page, even when an artifact was
+        // active. Passive title/loading updates still preserve that artifact.
+        openTab(ownerSessionId, payload.tab);
       }
       openOwnerSidePanel(payload?.ownerSessionId);
     });
@@ -639,7 +640,7 @@ export function SessionPage(props: SessionPageProps) {
       setSidePanelState(ownerKey, null);
     });
     return () => { unsubOpen?.(); unsubClose?.(); };
-  }, [openOwnerSidePanel, setCurrentSidePanel, setSidePanelState, sidePanelSessionKey]);
+  }, [openOwnerSidePanel, openTab, props.selectedSessionId, setCurrentSidePanel, setSidePanelState, sidePanelSessionKey]);
   const {
     leftSidebarResizing,
     leftSidebarWidth,
@@ -738,7 +739,6 @@ export function SessionPage(props: SessionPageProps) {
         preview: fileTarget.preview,
         target: fileTarget,
       });
-      preserveSidePanelOnPanelOpenRef.current = true;
       setCurrentSidePanel("panel");
     };
 
@@ -858,9 +858,6 @@ export function SessionPage(props: SessionPageProps) {
     if (panelRailActive && activeTab?.type === "artifact") {
       toggleCurrentSidePanel("panel");
       return;
-    }
-    if (!panelRailActive) {
-      preserveSidePanelOnPanelOpenRef.current = true;
     }
     if (!panelRailActive) {
       toggleCurrentSidePanel("panel");

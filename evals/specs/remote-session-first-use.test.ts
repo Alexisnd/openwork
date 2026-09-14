@@ -109,9 +109,19 @@ test("first cloud task provisions once over MCP, recovers its workspace, and pre
 
   async function runtimeRecord(workerId: string) {
     const rows = await queryDenDatabase(databaseUrl,
-      "SELECT id, sandbox_id, workspace_volume_id, data_volume_id, signed_preview_url, signed_preview_url_expires_at FROM daytona_sandbox WHERE worker_id = ?", [workerId]);
+      "SELECT id, provider_id, endpoint_kind, JSON_UNQUOTE(JSON_EXTRACT(provider_ref, '$.sandboxId')) AS sandbox_id, workspace_volume_id, data_volume_id, endpoint_url AS signed_preview_url, endpoint_expires_at AS signed_preview_url_expires_at FROM cloud_runtime_instance WHERE worker_id = ?", [workerId]);
     expect(rows).toHaveLength(1);
-    return record(rows[0]);
+    const current = record(rows[0]);
+    expect(current).toMatchObject({ provider_id: "daytona", endpoint_kind: "signed-expiring" });
+    expect(current.id).toMatch(/^cri_/);
+    const legacyRows = await queryDenDatabase(databaseUrl,
+      "SELECT id, sandbox_id, workspace_volume_id, data_volume_id, signed_preview_url, signed_preview_url_expires_at FROM daytona_sandbox WHERE worker_id = ?", [workerId]);
+    expect(legacyRows).toHaveLength(1);
+    const { id: legacyId, ...legacy } = record(legacyRows[0]);
+    const { id, provider_id, endpoint_kind, ...neutral } = current;
+    expect(legacyId).toMatch(/^dts_/);
+    expect(neutral).toEqual(legacy);
+    return current;
   }
 
   async function bothHealthy() {
@@ -266,12 +276,12 @@ test("first cloud task provisions once over MCP, recovers its workspace, and pre
 
   const beforeRefresh = await runtimeRecord(original.workerId);
   const beforeRefreshEvents = witness.events.length;
-  witness.expireEndpoint(original.id);
-  const expired = await fetch(`${beforeRefresh.signed_preview_url}/health`, { signal: AbortSignal.timeout(5_000) });
-  expect(expired.status).toBe(410);
-  await queryDenDatabase(databaseUrl, "UPDATE daytona_sandbox SET signed_preview_url_expires_at = '2000-01-01 00:00:00' WHERE worker_id = ?", [original.workerId]);
+  // Keep the legacy endpoint healthy: only the neutral row can require refresh.
+  await queryDenDatabase(databaseUrl, "UPDATE cloud_runtime_instance SET endpoint_expires_at = '2000-01-01 00:00:00' WHERE worker_id = ?", [original.workerId]);
   const refreshed = await instance();
   const afterRefresh = await runtimeRecord(original.workerId);
+  const expired = await fetch(`${beforeRefresh.signed_preview_url}/health`, { signal: AbortSignal.timeout(5_000) });
+  expect(expired.status).toBe(410);
   expect(refreshed).toMatchObject({ status: "ready", instanceName: original.id });
   expect(refreshed.url).not.toBe(beforeRefresh.signed_preview_url);
   expect(afterRefresh).toMatchObject({ id: beforeRefresh.id, sandbox_id: original.id, signed_preview_url: refreshed.url });
@@ -280,7 +290,7 @@ test("first cloud task provisions once over MCP, recovers its workspace, and pre
   expect((await call(writeToken, "read", { sessionId })).payload).toMatchObject({ sessionId, messageCount: 2 });
   expect(witness.sandboxes).toHaveLength(2);
   await colleagueUnaffected();
-  evidence.recordAssertionEvidence("Expired endpoint refresh does not recreate the runtime", "The stored endpoint was expired and the witness rejected the old URL. Resolve issued only a new signed endpoint, persisted a future expiry on the same instance row, and read the existing session. No bootstrap/start/create or changes to the colleague.", true);
+  evidence.recordAssertionEvidence("Expired endpoint refresh does not recreate the runtime", "Only the neutral row was expired; the legacy URL remained healthy until resolve issued a new signed endpoint. The old URL was then rejected, the future expiry was persisted on both tables, and the existing session remained readable. No bootstrap/start/create or changes to the colleague.", true);
 
   // Model an established workspace on an older image. The real public update
   // endpoint must flush, stop, and ask the adapter to prove restore before retire.
@@ -346,6 +356,7 @@ test("first cloud task provisions once over MCP, recovers its workspace, and pre
   const privateBootstraps = assertPrivateBootstrapTransport();
   evidence.recordAssertionEvidence("Bootstrap transport keeps credentials out of command requests",
     `${privateBootstraps} bootstraps used path-only asynchronous commands after private-directory, upload and permission requests. Credential values remained in raw-script uploads, never command requests; the witness observed the self-unlink prelude. This checks SDK HTTP transport, not Linux execution or actual filesystem permissions.`, true);
+  evidence.recordAssertionEvidence("Neutral instance reads keep Daytona rollback data current", "After provision, wake, endpoint refresh, rejected restore and successful recycle, both members retained one neutral instance row with provider and endpoint semantics. Its sandbox, volumes, URL and expiry matched the legacy Daytona row after every operation. Expiring only the neutral row triggered refresh, proving the new table owns reads.", true);
 
   await queryDenDatabase(databaseUrl, "UPDATE org_subscriptions SET status = 'canceled' WHERE organization_id = ?", [orgId]);
   expect((await call(writeToken, "create", task)).payload.error).toBe("openwork_web_access_required");
@@ -574,13 +585,14 @@ test("Cloud APIs recover after wake and replacement failures and attempt every o
   async function memberState(workerId: string) {
     return {
       workers: await queryDenDatabase(databaseUrl, "SELECT id, name, created_by_user_id, status, image_version FROM worker WHERE id = ?", [workerId]),
-      runtimes: await queryDenDatabase(databaseUrl, "SELECT id, sandbox_id, workspace_volume_id, data_volume_id FROM daytona_sandbox WHERE worker_id = ?", [workerId]),
+      runtimes: await queryDenDatabase(databaseUrl, "SELECT id, provider_id, provider_ref, workspace_volume_id, data_volume_id FROM cloud_runtime_instance WHERE worker_id = ?", [workerId]),
       tokens: await queryDenDatabase(databaseUrl, "SELECT id, scope, SHA2(token, 256) AS digest FROM worker_token WHERE worker_id = ? ORDER BY id", [workerId]),
     };
   }
 
   async function removeRuntimeRecord(workerId: string) {
     // Arrange the orphan path only; DELETE /v1/workers/:id owns deprovision and row removal.
+    await queryDenDatabase(databaseUrl, "DELETE FROM cloud_runtime_instance WHERE worker_id = ?", [workerId]);
     await queryDenDatabase(databaseUrl, "DELETE FROM daytona_sandbox WHERE worker_id = ?", [workerId]);
   }
 

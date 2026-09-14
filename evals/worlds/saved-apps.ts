@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { browserScript, type Surface } from "@openwork/cdp";
+import { addInitScript, browserScript, type Surface } from "@openwork/cdp";
 import type { Seed } from "@openwork/env";
 import type { MockMcpTool } from "@openwork/labs";
 import { go, runWorkflow, saveWorkflow, waitFor } from "@openwork/behaviors";
@@ -104,6 +104,7 @@ export async function isolatedMcpApps(seed: Seed) {
               report.forgedMessages += 1;
             }
           }
+          publish();
           try {
             const resultFromHelper = await app.callServerTool({ name: "read_detail", arguments: { marker: "legitimate-" + label } });
             report.helper = resultFromHelper;
@@ -125,7 +126,7 @@ export async function isolatedMcpApps(seed: Seed) {
       appHtml: await appHtml(label), result: { content: [{ type: "text", text: `initial-${label}` }], isError: false,
         structuredContent: { serverTools: { provider: label }, schemaGuidance: `provider-${label}` }, _meta: { privateFixture: `view-only-${label}` } } },
     { name: "read_detail", description: "Read this sample's detail", inputSchema: { type: "object", properties: { marker: { type: "string" } } },
-      annotations: { readOnlyHint: true, destructiveHint: false }, _meta: { ui: { resourceUri: `ui://sample-${label}/view.html`, visibility: ["app"] } },
+      annotations: { readOnlyHint: label === "B", destructiveHint: false }, _meta: { ui: { resourceUri: `ui://sample-${label}/view.html`, visibility: ["app"] } },
       result: { content: [{ type: "text", text: `helper-${label}` }], isError: label === "A", _meta: { privateFixture: `helper-only-${label}` } } },
   ];
   const workspacePath = seed.tmpPath("embedded-app-isolation");
@@ -145,8 +146,20 @@ export async function isolatedMcpApps(seed: Seed) {
     },
   });
   const session = await seed.session(app, { title: "Independent embedded apps" });
+  const observeNativeConfirm = browserScript(() => {
+    if (window !== window.top) return;
+    sessionStorage.setItem("mcpAppConfirmCalls", sessionStorage.getItem("mcpAppConfirmCalls") ?? "0");
+    window.confirm = () => {
+      sessionStorage.setItem("mcpAppConfirmCalls", String(Number(sessionStorage.getItem("mcpAppConfirmCalls")) + 1));
+      return false;
+    };
+  }, []);
+  const confirmRegistration = await addInitScript(app.client, observeNativeConfirm);
+  await evaluate(app.client, observeNativeConfirm);
   return { app, session, first: app.mocks.first, second: app.mocks.second,
+    nativeConfirmCalls: () => seed.evalIn(app, () => Number(sessionStorage.getItem("mcpAppConfirmCalls") ?? "NaN")),
     reports: async () => (await inAppDocuments(app, "isolation")).map(value => record(JSON.parse(value))),
+    [Symbol.asyncDispose]: () => confirmRegistration.dispose(),
   };
 }
 

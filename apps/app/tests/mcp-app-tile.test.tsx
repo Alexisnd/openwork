@@ -1,5 +1,5 @@
 /** @jsxImportSource react */
-import { expect, mock, test } from "bun:test";
+import { afterAll, expect, mock, spyOn, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { act, useLayoutEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -8,13 +8,12 @@ import { mcpAppResolutionRetryDelayMs } from "../src/app/lib/mcp-app-resolution"
 import { resolveDashboardMcpApp } from "../src/react-app/domains/dashboard/dashboard-mcp-app-resolution";
 import { createMcpAppActions } from "../src/components/chat/mcp-app-origin";
 import type { McpAppSandboxViewProps } from "../src/components/chat/mcp-app-frame";
-import { WorkspaceProvider } from "../src/react-app/shell/workspace-provider";
 import type { DashboardMcpAppEntry } from "../src/react-app/domains/dashboard/granted-dashboard-store";
 
 // Exercise the mounted tile and real action lifetime without starting an iframe or provider.
 mock.module("@/components/chat/mcp-app-frame", () => ({
   McpAppSandboxView: ({ app, origin }: McpAppSandboxViewProps) => {
-    const actions = useMemo(() => createMcpAppActions(origin, app, () => true), [origin, app]);
+    const actions = useMemo(() => createMcpAppActions(origin, app), [origin, app]);
     const [message, setMessage] = useState("");
     useLayoutEffect(() => () => actions.dispose(), [actions]);
     return <div>
@@ -26,6 +25,9 @@ mock.module("@/components/chat/mcp-app-frame", () => ({
   },
 }));
 
+GlobalRegistrator.register({ url: "http://localhost/" });
+afterAll(() => GlobalRegistrator.unregister());
+const { WorkspaceProvider } = await import("../src/react-app/shell/workspace-provider");
 const { McpAppTile } = await import("../src/react-app/domains/dashboard/mcp-app-tile");
 
 const resource: OpenworkMcpAppResource = {
@@ -143,8 +145,114 @@ test.each(["resolve", "wait"])("stops discovery and releases late leases when ow
   expect(released).toEqual(phase === "resolve" ? ["late-lease"] : []);
 });
 
+test.each(["manual", "automatic", "forbidden", "repeated", "cancel", "unmount", "endpoint", "scope", "persisted"])("launch approval policy without native confirmation: %s", async (mode) => {
+  const previousAct = Reflect.get(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+  Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", true);
+  const confirmSpy = spyOn(window, "confirm").mockReturnValue(false);
+  const calls: unknown[] = [];
+  let approvedLaunches = 0;
+  let autoLaunchDisabled = 0;
+  let autoLaunchEnabled = 0;
+  const client: OpenworkServerClient = { ...createOpenworkServerClient({ baseUrl: "http://fixture.invalid" }),
+    resolveMcpApp: async () => ({ app: { ...resource, launchId: "launch-fixture" } }),
+    callMcpAppTool: async (workspaceId, request) => {
+      calls.push({ workspaceId, request });
+      if (mode === "forbidden") throw new OpenworkServerError(403, "tool_denied", "Forbidden");
+      if (mode === "repeated" || !request.approved) throw new OpenworkServerError(422, "tool_requires_approval", "Approval required");
+      return { content: [] };
+    },
+    releaseMcpApp: async () => ({ released: true }),
+  };
+  const entry: DashboardMcpAppEntry = {
+    kind: "mcp", id: "approval-tile", title: "Fixture", serverName: "fixture", toolName: "render",
+    projectedToolName: "fixture_render", resourceUri: resource.resourceUri,
+    autoLaunch: mode === "automatic", launchApproved: mode === "persisted", launchArguments: { query: "saved input" },
+  };
+  const container = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(container);
+  let mounted = true;
+  let connected = true;
+  let scope = "approval-cache";
+  const render = () => root.render(<WorkspaceProvider client={null} openworkServerClient={connected ? client : null} workspaceId="fixture" selectedWorkspaceRoot="/fixture">
+    <McpAppTile entry={entry} cacheScopeKey={scope}
+      onApprovedLaunch={() => { approvedLaunches++; }}
+      onAutoLaunchDisabled={() => { autoLaunchDisabled++; }}
+      onAutoLaunchEnabled={() => { autoLaunchEnabled++; }} />
+  </WorkspaceProvider>);
+  const button = (label: string) => {
+    const found = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+    if (!found) throw new Error(`Missing button ${label}`);
+    return found;
+  };
+  const request = {
+    launchId: "launch-fixture", sessionId: null, serverName: "fixture", name: "render",
+    resourceUri: resource.resourceUri, arguments: structuredClone(entry.launchArguments),
+    ...(mode === "persisted" ? { approved: true } : {}),
+  };
+  const decision = (label: string) => {
+    const found = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="alertdialog"] button')).find(button => button.textContent === label);
+    if (!found) throw new Error(`Missing decision ${label}`);
+    return found;
+  };
+  try {
+    await act(async () => render());
+    if (mode !== "automatic") {
+      expect(calls).toEqual([]);
+      await act(async () => button("Run Fixture").click());
+    }
+    expect(calls).toEqual([{ workspaceId: "fixture", request }]);
+    const retried = mode === "manual" || mode === "repeated";
+    if (!["automatic", "forbidden", "persisted"].includes(mode)) {
+      expect(document.querySelector('[role="alertdialog"]')?.textContent).toContain("Allow App action?");
+      expect(document.querySelector('[role="alertdialog"] pre')?.textContent).toContain("saved input");
+      if (entry.launchArguments) entry.launchArguments.query = "changed after request";
+      if (mode === "unmount") { await act(async () => root.unmount()); mounted = false; }
+      else if (mode === "endpoint") { connected = false; await act(async () => render()); }
+      else if (mode === "scope") { scope = "another-principal"; await act(async () => render()); }
+      else await act(async () => decision(retried ? "Allow once" : "Cancel").click());
+    } else expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(calls).toEqual((retried ? [false, true] : [false]).map(approved => ({
+      workspaceId: "fixture", request: { ...request, ...(approved ? { approved: true } : {}) },
+    })));
+    expect(approvedLaunches).toBe(0);
+    expect(autoLaunchDisabled).toBe(["manual", "automatic", "repeated", "cancel"].includes(mode) ? 1 : 0);
+    expect(autoLaunchEnabled).toBe(0);
+    if (mode === "automatic") {
+      expect(button("Run Fixture").disabled).toBe(false);
+      expect(container.querySelector("[data-action-result]")).toBeNull();
+      entry.autoLaunch = false;
+      await act(async () => render());
+      expect(calls).toHaveLength(1);
+      expect(autoLaunchDisabled).toBe(1);
+    } else if (mode === "manual") {
+      expect(container.querySelector("[data-action-result]")).not.toBeNull();
+      await act(async () => render());
+      expect(calls).toHaveLength(2);
+      await act(async () => button("Refresh Fixture").click());
+      expect(calls).toEqual([
+        { workspaceId: "fixture", request },
+        { workspaceId: "fixture", request: { ...request, approved: true } },
+        { workspaceId: "fixture", request: { ...request, arguments: { query: "changed after request" } } },
+      ]);
+      await act(async () => decision("Cancel").click());
+      expect(calls).toHaveLength(3);
+      expect(approvedLaunches).toBe(0);
+      expect(autoLaunchEnabled).toBe(0);
+    } else if (mode === "forbidden" || mode === "repeated") {
+      expect(container.textContent).toContain(mode === "forbidden" ? "Forbidden" : "Approval required");
+      expect(container.querySelector("[data-action-result]")).toBeNull();
+    }
+    expect(confirmSpy).not.toHaveBeenCalled();
+  } finally {
+    if (mounted) await act(async () => root.unmount());
+    confirmSpy.mockRestore();
+    container.remove();
+    Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", previousAct);
+  }
+});
+
 test("a mounted tile retains its lease across fallback refreshes, but releases on owner removal, refresh and unmount", async () => {
-  GlobalRegistrator.register({ url: "http://localhost/" });
   const previousAct = Reflect.get(globalThis, "IS_REACT_ACT_ENVIRONMENT");
   Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", true);
   const leases = new Set<string>();
@@ -233,7 +341,6 @@ test("a mounted tile retains its lease across fallback refreshes, but releases o
     await act(async () => root.unmount());
     container.remove();
     Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", previousAct);
-    await GlobalRegistrator.unregister();
   }
   expect(released).toEqual(["launch-1", "launch-2", "launch-3"]);
   expect(leases.size).toBe(0);

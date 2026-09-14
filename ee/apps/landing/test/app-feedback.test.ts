@@ -34,6 +34,23 @@ function formRequest(overrides: Record<string, unknown> = {}, origin = "https://
   });
 }
 
+function submittedMetadata(): unknown {
+  const body = requests[1].body;
+  if (!body || typeof body !== "object" || !("variables" in body)) throw new Error("Missing variables");
+  const variables = body.variables;
+  if (!variables || typeof variables !== "object" || !("input" in variables)) throw new Error("Missing input");
+  const input = variables.input;
+  if (!input || typeof input !== "object" || !("threadFields" in input) || !Array.isArray(input.threadFields)) {
+    throw new Error("Missing thread fields");
+  }
+  const metadata: unknown = input.threadFields.find((field: unknown) =>
+    field && typeof field === "object" && "key" in field && field.key === "openwork_metadata");
+  if (!metadata || typeof metadata !== "object" || !("stringValue" in metadata) || typeof metadata.stringValue !== "string") {
+    throw new Error("Missing metadata");
+  }
+  return JSON.parse(metadata.stringValue);
+}
+
 function customerResponse(result = "CREATED") {
   return Response.json({ data: { upsertCustomer: { result, customer: { id: "c_test" }, error: null } } });
 }
@@ -127,17 +144,24 @@ describe("contact and feedback submissions to Plain", () => {
         onCreate: { fullName: "Test User", email: { email: "test@example.com", isVerified: false } },
         onUpdate: {},
       } } });
+      const metadata = submittedMetadata();
       expect(requests[1].body).toMatchObject({ variables: { input: {
         customerIdentifier: { customerId: "c_test" },
         title: mode === "contact" ? "OpenWork contact message" : "OpenWork app feedback",
-        components: [
-          { componentPlainText: { plainText: "Please help with this issue." } },
-          { componentPlainText: { plainText: "Submitted by: Test User\nEmail: test@example.com" } },
-          { componentPlainText: { plainText: expect.stringMatching(
-            /^Source: openwork-app\nEntrypoint: \/settings\nDeployment: desktop\nApp version: 1.0.0\nOpenWork server: 1.1.0\nOpenCode: 1.2.0\nOS: macOS 15\nPlatform: darwin\nSubmitted: /,
-          ) } },
+        threadFields: [
+          { key: "openwork_os_name", type: "STRING", stringValue: "macOS" },
+          { key: "openwork_app_version", type: "STRING", stringValue: "1.0.0" },
+          { key: "openwork_deployment", type: "STRING", stringValue: "desktop" },
+          { key: "openwork_metadata", type: "STRING", stringValue: expect.any(String) },
         ],
+        components: [{ componentPlainText: { plainText: "Please help with this issue." } }],
       } } });
+      expect(metadata).toEqual({
+        name: "Test User", email: "test@example.com", mode,
+        source: "openwork-app", entrypoint: "/settings", openworkServerVersion: "1.1.0",
+        opencodeVersion: "1.2.0", osVersion: "15", platform: "darwin",
+        submittedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      });
     });
   }
 
@@ -146,6 +170,42 @@ describe("contact and feedback submissions to Plain", () => {
     expect((await POST(formRequest())).status).toBe(200);
     expect(requests[0].body).toMatchObject({ variables: { input: { onUpdate: {} } } });
     expect(requests[1].body).toMatchObject({ variables: { input: { customerIdentifier: { customerId: "c_test" } } } });
+  });
+
+  test("omits unavailable desktop fields for a web contact submission", async () => {
+    const response = await POST(formRequest({ mode: "contact", context: {
+      source: "openwork-contact-page", entrypoint: "/contact", deployment: "landing", platform: "web",
+      appVersion: "", openworkServerVersion: "unknown", osName: "  ", osVersion: null,
+    } }));
+    expect(response.status).toBe(200);
+    const metadata = submittedMetadata();
+    expect(requests[1].body).toMatchObject({ variables: { input: { threadFields: [
+      { key: "openwork_deployment", type: "STRING", stringValue: "landing" },
+      { key: "openwork_metadata", type: "STRING", stringValue: expect.any(String) },
+    ] } } });
+    expect(metadata).toEqual({
+      name: "Test User", email: "test@example.com", mode: "contact",
+      source: "openwork-contact-page", entrypoint: "/contact", platform: "web",
+      submittedAt: expect.any(String),
+    });
+  });
+
+  test("preserves version strings and only writes allowlisted, sanitized context", async () => {
+    const response = await POST(formRequest({ context: {
+      appVersion: " 1.2.3-beta.4+build.5 ", osVersion: " 10/11 ",
+      source: "s".repeat(300), platform: 123,
+      openwork_form_mode: "override", arbitrary_field: "ignore",
+    } }));
+    expect(response.status).toBe(200);
+    const metadata = submittedMetadata();
+    expect(requests[1].body).toMatchObject({ variables: { input: { threadFields: [
+      { key: "openwork_app_version", type: "STRING", stringValue: "1.2.3-beta.4+build.5" },
+      { key: "openwork_metadata", type: "STRING", stringValue: expect.any(String) },
+    ] } } });
+    expect(metadata).toEqual({
+      name: "Test User", email: "test@example.com", mode: "feedback",
+      source: "s".repeat(240), osVersion: "10/11", submittedAt: expect.any(String),
+    });
   });
 
   test("does not report success when Plain is not configured", async () => {

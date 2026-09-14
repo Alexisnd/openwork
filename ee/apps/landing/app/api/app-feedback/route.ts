@@ -1,18 +1,7 @@
 import { buildResponseHeaders, jsonResponse, rateLimitFormRequest, validateAntiSpamFields, validateTrustedOrigin, verifyFormBotProtection } from "../_lib/security";
 import { createPlainFormClient } from "../_lib/plain";
 import { ForbiddenError } from "@team-plain/graphql";
-
-type FeedbackContext = {
-  source?: string;
-  entrypoint?: string;
-  deployment?: string;
-  appVersion?: string;
-  openworkServerVersion?: string;
-  opencodeVersion?: string;
-  osName?: string;
-  osVersion?: string;
-  platform?: string;
-};
+import { buildFeedbackThreadFields, type FeedbackContext } from "../../../lib/plain-feedback-fields";
 
 type FeedbackPayload = {
   name?: string;
@@ -40,22 +29,6 @@ function sanitizeContext(input: FeedbackContext | undefined) {
     osVersion: sanitizeValue(input?.osVersion),
     platform: sanitizeValue(input?.platform),
   };
-}
-
-function formatDiagnosticsSummary(context: ReturnType<typeof sanitizeContext>) {
-  const osLabel = [context.osName, context.osVersion].filter(Boolean).join(" ");
-  const lines = [
-    ["Source", context.source],
-    ["Entrypoint", context.entrypoint],
-    ["Deployment", context.deployment],
-    ["App version", context.appVersion],
-    ["OpenWork server", context.openworkServerVersion],
-    ["OpenCode", context.opencodeVersion],
-    ["OS", osLabel],
-    ["Platform", context.platform],
-  ].filter(([, value]) => value);
-
-  return lines.map(([label, value]) => `${label}: ${value}`).join("\n");
 }
 
 export async function POST(request: Request) {
@@ -126,7 +99,6 @@ export async function POST(request: Request) {
   }
 
   const context = sanitizeContext(payload.context);
-  const diagnosticsSummary = formatDiagnosticsSummary(context);
   const submittedAt = new Date().toISOString();
 
   const apiKey = process.env.PLAIN_API_KEY?.trim();
@@ -156,12 +128,9 @@ export async function POST(request: Request) {
     const threadResult = await plain.createThread({
       customerIdentifier: { customerId: customerResult.customer.id },
       title: mode === "contact" ? "OpenWork contact message" : "OpenWork app feedback",
+      threadFields: buildFeedbackThreadFields({ ...context, name, email, mode, submittedAt }),
       components: [
         { componentPlainText: { plainText: message } },
-        { componentPlainText: { plainText: `Submitted by: ${name}\nEmail: ${email}` } },
-        { componentPlainText: {
-          plainText: [diagnosticsSummary, `Submitted: ${submittedAt}`].filter(Boolean).join("\n"),
-        } },
       ],
     });
     if (threadResult.error || !threadResult.thread?.id) {

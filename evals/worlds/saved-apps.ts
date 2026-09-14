@@ -7,11 +7,14 @@ import { go, runWorkflow, saveWorkflow, waitFor } from "@openwork/behaviors";
 import { connect, debuggerUrlFor, evaluate, listTargets } from "@openwork/cdp";
 import { configureProvider } from "./chat.ts";
 import { defaultDaytonaExec, execInSandbox } from "@openwork/hosts";
+import { reconcileDraftHost } from "../fixtures/cloud-draft-host.ts";
 
 export const creationPrompt = "Create a reusable app for my dashboard that shows a weekly briefing using my existing Weekly briefing workflow.";
 export const creationReply = "Your briefing app draft is ready. Try the preview, then choose Save.";
 export const isolationPrompt = "Open both independent sample apps, the second sample first.";
 export const isolationReply = "Both sample apps are open.";
+export const draftRoutingPrompt = "Prepare a Slack draft for Test recipient saying the review is ready. Do not send it.";
+export const draftRoutingReply = "The Slack draft is ready for review. Nothing was sent.";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -160,6 +163,127 @@ export async function isolatedMcpApps(seed: Seed) {
     nativeConfirmCalls: () => seed.evalIn(app, () => Number(sessionStorage.getItem("mcpAppConfirmCalls") ?? "NaN")),
     reports: async () => (await inAppDocuments(app, "isolation")).map(value => record(JSON.parse(value))),
     [Symbol.asyncDispose]: () => confirmRegistration.dispose(),
+  };
+}
+
+export async function cloudDraftRouting(seed: Seed) {
+  const appRequire = createRequire(new URL("../../apps/app/package.json", import.meta.url));
+  const { build } = await import(createRequire(appRequire.resolve("vite")).resolve("esbuild"));
+  const bundle = await build({
+    stdin: { resolveDir: fileURLToPath(new URL("../../apps/app", import.meta.url)), contents: `
+      import { App } from "@modelcontextprotocol/ext-apps";
+      const app = new App({ name: "Slack draft review", version: "1" }, {});
+      const report = { input: null, result: null, helper: null, rejected: [], complete: false };
+      const publish = () => { document.body.dataset.isolationReport = JSON.stringify(report); };
+      app.ontoolinput = ({ arguments: args }) => { report.input = args; publish(); };
+      app.ontoolresult = async result => {
+        if (report.result !== null) return;
+        report.result = result;
+        publish();
+        try {
+          report.helper = await app.callServerTool({ name: "resolve_recipient", arguments: { recipient: "Test recipient" } });
+          for (const name of ["unknown_helper", "other_server_helper"]) {
+            try { await app.callServerTool({ name, arguments: { recipient: "Test recipient" } }); }
+            catch (error) { report.rejected.push({ name, error: error.message }); }
+          }
+          report.complete = true;
+          document.querySelector("p").textContent = "Recipient resolved: Test recipient. Draft only; nothing sent.";
+        } catch (error) { report.error = error.message; }
+        publish();
+      };
+      app.connect().catch(error => { report.error = error.message; publish(); });
+    ` }, bundle: true, write: false, format: "iife", platform: "browser", minify: true,
+  });
+  const appHtml = `<!doctype html><html><head><title>Slack draft review</title><style>body{font:16px system-ui;padding:24px;color:#182331}blockquote{padding:16px;background:#f0f4f8}</style></head><body><h1>Slack draft review</h1><h2>To: Test recipient</h2><blockquote>The review is ready.</blockquote><p>Draft only. Nothing sent.</p><script>${bundle.outputFiles[0].text.replaceAll("</script", "<\\/script")}</script></body></html>`;
+  const schema = { type: "object", properties: { recipient: { type: "string" } }, required: ["recipient"] };
+  const den = await seed.den({ org: { name: `Draft routing ${Date.now()}` }, mocks: {
+    slack: seed.mock({ allowUnauthenticatedMcp: true, tools: [
+      { name: "render_slack_draft", description: "Review a Slack draft without sending", inputSchema: schema,
+        _meta: { ui: { resourceUri: "ui://slack-draft/review.html" } }, appHtml,
+        result: { content: [{ type: "text", text: "Draft ready for Test recipient" }], isError: false } },
+      { name: "resolve_recipient", description: "Resolve a draft recipient", inputSchema: schema,
+        annotations: { readOnlyHint: true, destructiveHint: false },
+        _meta: { ui: { visibility: ["app"] } },
+        result: { content: [{ type: "text", text: "Test recipient resolved" }], structuredContent: { recipient: "Test recipient", id: "synthetic-recipient" }, isError: false } },
+    ] }),
+    other: seed.mock({ allowUnauthenticatedMcp: true, tools: [
+      { name: "resolve_recipient", description: "Same-named helper on another server", inputSchema: schema,
+        _meta: { ui: { visibility: ["app"] } }, result: { content: [], structuredContent: { id: "wrong-server-recipient" } } },
+      { name: "other_server_helper", description: "Helper belonging to another server", inputSchema: schema,
+        _meta: { ui: { visibility: ["app"] } }, result: { content: [{ type: "text", text: "Must not dispatch" }] } },
+    ] }),
+  } });
+  const connection = await seed.orgConnection(den.admin, { name: "Synthetic Slack", url: den.mocks.slack.mcpUrl, authType: "none", credentialMode: "shared", access: { orgWide: true } });
+  await seed.orgConnection(den.admin, { name: "Other synthetic server", url: den.mocks.other.mcpUrl, authType: "none", credentialMode: "shared", access: { orgWide: true } });
+  const orgId = field(record((await seed.api(den.admin, "/v1/org")).body).organization, "id");
+  const credentials = (await seed.api(den.admin, "/v1/mcp/token", { method: "POST", headers: { "x-openwork-org-id": orgId }, body: JSON.stringify({ scopes: ["mcp:read", "mcp:write"] }) })).body;
+  const configured = await fetch(`${den.mocks.slack.url}/admin/agent-workloads`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workloads: [{ promptMarker: draftRoutingPrompt, finalReply: draftRoutingReply, steps: [
+      { tool: "execute_capability", arguments: { name: `mcp:${connection.id}:render_slack_draft`, body: { recipient: "Test recipient" } } },
+    ] }] }), signal: AbortSignal.timeout(15_000),
+  });
+  if (!configured.ok) throw new Error(`Draft model setup failed: ${configured.status}`);
+  const workspacePath = seed.tmpPath("cloud-draft-routing");
+  const denOrigin = new URL(den.ref.apiUrl);
+  const app = await seed.appWeb({ name: "preactivated-synthetic-cloud-draft-routing", workspacePath, headless: true,
+    ...(denOrigin.protocol === "https:" ? { syntheticPreactivatedDenOrigin: denOrigin.origin } : {}) });
+  const workspace = await seed.workspace(app, workspacePath);
+  await configureProvider(seed, app, workspace.workspaceId, "draft-model", "draft-model", {
+    provider: { "draft-model": { npm: "@ai-sdk/openai-compatible", name: "Draft model fixture", options: { baseURL: `${den.mocks.slack.url}/v1`, apiKey: "sk-draft-fixture" }, models: { "draft-model": { name: "Draft model fixture" } } } },
+    mcp: { "openwork-cloud": { type: "remote", url: `${den.ref.apiUrl}/mcp/agent`, enabled: true, oauth: false,
+      headers: { Authorization: `Bearer ${field(credentials, "token")}` } } },
+  });
+  const gateway = await seed.evalIn(app, browserScript(async (workspaceId) => {
+    const base = "http://127.0.0.1:" + localStorage.getItem("openwork.server.port");
+    const response = await fetch(base + "/workspace/" + encodeURIComponent(workspaceId) + "/opencode/mcp", {
+      headers: { Authorization: "Bearer " + localStorage.getItem("openwork.server.token") },
+      signal: AbortSignal.timeout(30_000),
+    });
+    const value = await response.json();
+    return { status: response.status, gatewayStatus: typeof value?.["openwork-cloud"]?.status === "string" ? value["openwork-cloud"].status : null };
+  }, [workspace.workspaceId]), { awaitPromise: true, timeoutMs: 35_000 });
+  if (record(gateway).status !== 200 || record(gateway).gatewayStatus !== "connected") throw new Error(`Fixture gateway did not connect during engine configuration: ${JSON.stringify(gateway)}`);
+  const session = await seed.session(app, { title: "Slack draft review" });
+  const hostSetup = {
+    name: app.handle.name, openworkUrl: app.openworkUrl, workspaceRoot: app.workspaceRoot,
+    workspaceId: workspace.workspaceId, cloudUrl: `${den.ref.apiUrl}/mcp/agent`,
+    token: field(credentials, "token"), appHostToken: field(credentials, "appHostToken"),
+  };
+  const reconciled = app.handle.sandboxId
+    ? record(JSON.parse((await execInSandbox(defaultDaytonaExec, app.handle.sandboxId,
+      `node /workspace/evals/fixtures/cloud-draft-host.ts ${Buffer.from(JSON.stringify(hostSetup)).toString("base64url")}`,
+      { context: "Reconcile the owned draft host", timeoutMs: 150_000 })).stdout.trim()))
+    : await reconcileDraftHost(hostSetup);
+  if (record(reconciled).status !== 200 || record(reconciled).phase !== "ready" || record(reconciled).diagnostic !== "ready") throw new Error(`Cloud reconcile failed: ${JSON.stringify(reconciled)}`);
+  return { app, session, den, connectionId: connection.id, reconciled,
+    async launchDiagnostics(sinceIso: string) {
+      const sanitize = (value: string) => [field(credentials, "token"), field(credentials, "appHostToken")]
+        .reduce((text, secret) => text.replaceAll(secret, "[redacted]"), value)
+        .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+        .replace(/https?:\/\/[^\s<>"']+/g, "[url omitted]")
+        .replace(/\b(?:owt_|sk-)[a-zA-Z0-9_-]+/g, "[redacted]").slice(0, 6000);
+      const visible = await seed.evalIn(app, () => document.body.innerText);
+      const targets = (await listTargets(app.handle.cdpUrl)).filter(target => target.type === "iframe").map(target => {
+        if (target.url === "about:srcdoc" || target.url === "about:blank") return { type: target.type, url: target.url };
+        try {
+          const url = new URL(target.url);
+          return { type: target.type, url: ["/mcp-apps/sandbox.html", "/mcp-apps/proxy.html"].includes(url.pathname) && !url.username && !url.password && !url.search && !url.hash
+            ? url.pathname : "[url omitted]" };
+        } catch { return { type: target.type, url: "[url omitted]" }; }
+      });
+      const countNames = (calls: { name: string }[]) => calls.reduce<Record<string, number>>((counts, call) => {
+        counts[call.name] = (counts[call.name] ?? 0) + 1;
+        return counts;
+      }, {});
+      const requests = await den.mocks.slack.agentRequests({ promptMarker: draftRoutingPrompt });
+      return { visible: sanitize(typeof visible === "string" ? visible : ""), targets,
+        providerCalls: countNames(await den.mocks.slack.toolCalls({ sinceIso, atLeast: 0 })),
+        otherProviderCalls: countNames(await den.mocks.other.toolCalls({ sinceIso, atLeast: 0 })),
+        modelResults: requests.map(request => ({ kind: request.kind, toolName: request.toolName, toolResultCodes: request.toolResultCodes })),
+      };
+    },
+    reports: async () => (await inAppDocuments(app, "isolation")).map(value => record(JSON.parse(value))),
   };
 }
 

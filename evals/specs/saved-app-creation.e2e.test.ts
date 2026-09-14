@@ -1,9 +1,56 @@
 import { expect } from "vitest";
 import { saveWorkflow, runWorkflow } from "@openwork/behaviors";
 import { spec } from "@openwork/testkit";
-import { creationPrompt, creationReply, field, record, savedAppCreation, isolatedMcpApps, isolationPrompt, isolationReply } from "../worlds/saved-apps.ts";
+import { creationPrompt, creationReply, field, record, savedAppCreation, isolatedMcpApps, isolationPrompt, isolationReply, cloudDraftRouting, draftRoutingPrompt, draftRoutingReply } from "../worlds/saved-apps.ts";
 
 const test = spec.world(savedAppCreation, { timeout: 900_000 });
+
+const draftTest = spec.world(cloudDraftRouting, {
+  resources: { surfaces: ["appWeb"], services: ["den", "mock"] },
+  needs: { commands: ["bun", "pnpm", "opencode"] }, timeout: 600_000,
+});
+
+draftTest("APP-DRAFT-ROUTING Cloud SDK draft resolves its recipient without dispatching unknown or cross-server helpers", async ({ world, agent, user, probe, evidence }) => {
+  const sinceIso = new Date().toISOString();
+  expect(draftRoutingPrompt).not.toContain(world.connectionId);
+  await agent.send(draftRoutingPrompt);
+  await user.see({ text: draftRoutingReply }, { timeoutMs: 120_000 });
+  await user.screenshot();
+  const modelRequests = (await world.den.mocks.slack.agentRequests({ promptMarker: draftRoutingPrompt }))
+    .filter(request => request.kind === "tool" || request.kind === "final");
+  expect(modelRequests.length).toBeGreaterThan(0);
+  for (const request of modelRequests) {
+    expect(request.advertisedToolNames?.some(name => name.endsWith("execute_capability"))).toBe(true);
+    expect(request.advertisedToolNames?.some(name => name.includes("resolve_recipient") || name.includes("other_server_helper"))).toBe(false);
+  }
+  try {
+    const launches = await world.den.mocks.slack.toolCalls({ name: "render_slack_draft", sinceIso, atLeast: 0 });
+    expect(launches.map(call => call.args), "The gateway must dispatch the originating provider launch before SDK rendering").toEqual([{ recipient: "Test recipient" }]);
+    const launched = await probe.eventually(() => world.reports(), { within: 30_000, label: "SDK draft received launch result", until: values => values.some(value => value.result !== null) });
+    expect(launched).toHaveLength(1);
+    expect(launched[0]).toMatchObject({ input: { recipient: "Test recipient" }, result: {
+      content: [{ type: "text", text: "Draft ready for Test recipient" }], isError: false,
+    } });
+  } catch (error) {
+    const diagnostics = await world.launchDiagnostics(sinceIso);
+    evidence.recordAssertionEvidence("Synthetic draft launch failure diagnostics", JSON.stringify(diagnostics), false);
+    await user.screenshot();
+    throw error;
+  }
+  const reports = await probe.eventually(() => world.reports(), { within: 30_000, label: "SDK recipient resolution and rejected helpers", until: values => values.some(value => value.complete === true) });
+  expect(reports).toHaveLength(1);
+  expect(reports[0]).toMatchObject({ input: { recipient: "Test recipient" }, helper: { isError: false, structuredContent: { recipient: "Test recipient", id: "synthetic-recipient" } }, complete: true });
+  const rejected = reports[0].rejected;
+  expect(rejected).toEqual([{ name: "unknown_helper", error: expect.any(String) }, { name: "other_server_helper", error: expect.any(String) }]);
+  const calls = await world.den.mocks.slack.toolCalls({ sinceIso, atLeast: 2 });
+  expect(calls.map(call => ({ name: call.name, args: call.args }))).toEqual([
+    { name: "render_slack_draft", args: { recipient: "Test recipient" } },
+    { name: "resolve_recipient", args: { recipient: "Test recipient" } },
+  ]);
+  expect(await world.den.mocks.other.toolCalls({ sinceIso, atLeast: 0 })).toEqual([]);
+  await user.screenshot();
+  evidence.recordAssertionEvidence("Cloud draft helpers stay on their originating connection", JSON.stringify({ reconciled: world.reconciled, reports, calls: calls.map(call => ({ name: call.name, args: call.args })), otherDispatches: 0 }), true);
+});
 
 const isolationTest = spec.world(isolatedMcpApps, {
   resources: { surfaces: ["appWeb"], services: ["mock"] },

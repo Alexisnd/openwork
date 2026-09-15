@@ -1202,7 +1202,7 @@ export class CloudProviderSync {
       // Local credentials only satisfy materialization eligibility. Never add
       // their values to Den's env entries or cloud cleanup ownership.
       const localEnvNames = storedEnv
-        .filter((entry) => entry.value.trim().length > 0 && !this.ownedEnvKeys.has(entry.key))
+        .filter((entry) => entry.value.trim().length > 0 && this.ownedEnvKeys.get(entry.key) !== hashString(entry.value))
         .map((entry) => entry.key);
       const prepared = prepareMaterialization([...llmProviders, ...(inferenceProviders ?? [])], localEnvNames);
       // Ownership follows the apply that can write, not a pending session.
@@ -1513,24 +1513,17 @@ export class CloudProviderSync {
     for (const id of readStringList(saved.providerIds)) this.managedProviderIds.add(id);
     // Workspace import baselines are collaborator-writable metadata, not proof
     // of ownership for runtime, credential, or auth cleanup.
-    const storedEnv = new Map((await this.env.list()).map((entry) => [entry.key, entry.value]));
     const runtimes = [await readGlobalRuntimeOpencodeConfig(this.config)];
     for (const workspace of this.config.workspaces) {
       runtimes.push(await readRuntimeOpencodeConfig(this.config, workspace.id));
     }
     for (const runtime of runtimes) {
       for (const [id, provider] of Object.entries(runtimeProviderMap(runtime))) {
-        // Upgrade current dev's BYOK config: only the exact row's scoped env
-        // binding is evidence. A bare key or an orphan LPR_/IPR_ prefix is not.
         if (!/^lpr_[a-z0-9]{26}$/.test(id) || typeof provider.npm !== "string" || typeof provider.id !== "string") continue;
         const prefix = `LPR_${id.slice(-5).toUpperCase()}_`;
         const names = readProviderEnvNames(provider);
         if (!names.length || !names.every((name) => name.startsWith(prefix))) continue;
         this.managedProviderIds.add(id);
-        for (const name of names) {
-          const value = storedEnv.get(name);
-          if (value !== undefined && !this.ownedEnvKeys.has(name)) this.ownedEnvKeys.set(name, hashString(value));
-        }
       }
     }
     await this.persistOwnership();

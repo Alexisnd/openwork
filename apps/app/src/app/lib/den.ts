@@ -297,9 +297,11 @@ export type DenCloudStartupFailure = {
   occurredAt: string;
 };
 
+export type DenCloudInstanceUpdateDeferral = "busy" | "activity_unknown";
+
 export type DenCloudInstanceUpdateResult =
   | { ok: true; status: "update_requested" }
-  | { ok: false; error: "already_current" | "flush_failed" };
+  | { ok: false; error: "already_current" | "flush_failed" | DenCloudInstanceUpdateDeferral };
 
 export type DenMcpToken = {
   token: string;
@@ -2021,7 +2023,13 @@ function parseCloudInstanceUpdateResult(payload: unknown): DenCloudInstanceUpdat
     return { ok: true, status: "update_requested" };
   }
 
-  if (payload.ok === false && (payload.error === "already_current" || payload.error === "flush_failed")) {
+  if (
+    payload.ok === false
+    && (payload.error === "already_current"
+      || payload.error === "flush_failed"
+      || payload.error === "busy"
+      || payload.error === "activity_unknown")
+  ) {
     return { ok: false, error: payload.error };
   }
 
@@ -3254,7 +3262,9 @@ export function createDenClient(options: { baseUrl: string; apiBaseUrl?: string 
         method: "POST",
         token,
         organizationId: orgId,
-        body: {},
+        // Tell Den this shell understands a deferred update; shells that do not
+        // opt in keep receiving the older already_current / flush_failed answers.
+        body: { acceptsDeferral: true },
       });
       const result = parseCloudInstanceUpdateResult(payload);
       if (!result) {
